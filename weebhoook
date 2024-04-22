@@ -1,0 +1,165 @@
+import datetime
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from io import BytesIO
+from os import remove as remove_file
+import json
+import requests
+import datetime
+from urllib.parse import parse_qs, urlsplit
+import threading
+import queue
+import pysftp
+
+
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'SEGW WEBHOOK')
+
+    def do_POST(self):
+        response = BytesIO()
+        if self.path.startswith('/alert'):
+            parsed_path = urlsplit(self.path)
+            parsed_body = parse_qs(parsed_path.query)
+            body = {}
+            if 'Content-Length' in self.headers.keys() and int(self.headers['Content-Length']) > 0:
+                print('Processing body')
+                content_length = int(self.headers['Content-Length'])
+                body = self.rfile.read(content_length).decode('UTF-8')
+            elif 'watch_id' in parsed_body.keys():
+                print('Processing params on query string')
+                for param in parsed_body.keys():
+                    body[param] = parsed_body[param][0]
+                body = json.dumps(body)
+            else:
+                print('No data to process')
+                response.write(b'No Alert Data. ')
+            if len(body) > 0:
+                print(f"{body}")
+                alerter = AlertWriter(body, ack_q)
+                alerter.create_alert_file()
+                if alerter.error_msg != "":
+                    response.write(b'Alert receipt failed. ')
+                    response.write(f'{alerter.error_msg}'.encode())
+                    alerter.error_msg = ""
+                else:
+                    response.write(b'Alert received. ')
+                    alerter.send_alert_message()
+                    if alerter.error_msg == "":
+                        response.write(b'Alert Sent. ')
+                        print('Sending ack')
+                        alerter.ack_alert()
+                        if alerter.error_msg != "":
+                            print('Watcher Acknowledgement failed.')
+                            response.write(b'Watcher Acknowledgement failed. ')
+                            response.write(f'{alerter.error_msg}. '.encode())
+                            alerter.error_msg = ""
+                        else:
+                            response.write(b'Watcher Acknowledged.')
+                    else:
+                        response.write(b'Alert Send failed. ')
+                        response.write(f'{alerter.error_msg}. '.encode())
+                        alerter.error_msg = ""
+        else:
+            response.write(b'Nothing to do. ')
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(response.getvalue())
+
+
+class AlertWriter:
+
+    def __init__(self, request_data: json, q: queue.Queue):
+        self.ack_q = q
+        self.ftp_data = None
+        self.params = json.loads(request_data)
+        self.error_msg = ""
+        alert_timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')
+        self.filename = f"SEGW-{alert_timestamp}"
+
+    def send_alert_message(self):
+        self.ftp_data = self.ftp_config()
+        try:
+            cn_opts = pysftp.CnOpts(knownhosts="/elk/known_hosts")
+            print("connect to sftp host")
+            with pysftp.Connection(self.ftp_data["host"], username=self.ftp_data["username"], private_key='/elk/sftp_id_rsa', cnopts=cn_opts) as sftp:
+                with sftp.cd(f'{self.ftp_data["remote_path"]}'):
+                    sftp.put(f'/tmp/{self.filename}')
+                    print("File transferred")
+        except Exception as e:
+            self.error_msg = f'ftp failed: {e}'
+            print(f'ftp failed: {e}')
+        finally:
+            remove_file(f'/tmp/{self.filename}')
+
+    def create_alert_file(self):
+        try:
+            template_add = ""
+            template_string = f"""
+Watcher ID: {self.params['watch_id']}
+Triggered time: {self.params['trigger_time']}"""
+            if "queue_name" in self.params.keys():
+                template_add = f"{template_add}Queue name: {self.params['queue_name']}\n"
+            if "check_time" in self.params.keys():
+                template_add = f"{template_add}No of hours: {self.params['check_time']}\n"
+            if "threshold_level" in self.params.keys():
+                template_add = f"{template_add}Threshold Level: {self.params['threshold_level']}\n"
+            if "cpu_level" in self.params.keys():
+                template_add = f"{template_add}CPU Level: {float(self.params['cpu_level']) * 100}\n"
+            if "server_name" in self.params.keys():
+                template_add = f"{template_add}WL admin / managed server name: {self.params['server_name']}\n"
+            if "message_id" in self.params.keys():
+                template_add = f"{template_add}Message ID: {self.params['message_id']}\n"
+            if "rds_trx_count" in self.params.keys():
+                template_add = f"{template_add}Count of active transactions blocked: {self.params['rds_trx_count']}\n"
+            template_string = f"{template_string}\n{template_add}"
+            template_string = f"{template_string}Alert level: Critical\nMessage: {self.params['watch_text']}"
+            with open(f'/tmp/{self.filename}', 'w') as f:
+                f.write(template_string)
+        except KeyError as e:
+            self.error_msg = f'Missing parameter. {e}'
+
+    def ftp_config(self):
+        return {
+            'host': '{{ alert_ftp.server }}',
+            'username': '{{ alert_ftp.user }}',
+            'remote_path': '{{ alert_ftp.path }}'
+        }
+
+    def ack_alert(self):
+        try:
+            self.ack_q.put(self.params['watch_id'])
+        except Exception as e:
+            self.error_msg = f'Alert acknowledgement failed. {e}'
+
+
+ack_q = queue.Queue(10)
+
+
+def queue_worker():
+    while True:
+        print('Checking Queue')
+        watcher_name = ack_q.get()
+        url = f'https://localhost:9200/_watcher/watch/{watcher_name}/_ack/send_critical_alert'
+        time.sleep(10)
+        try:
+            print(f'Adding {watcher_name} from queue')
+            with requests.Session() as req:
+                req.auth = ('elastic', '{{ lookup("community.hashi_vault.hashi_vault", es_admin_secret) }}')
+                resp = req.post(url=url, verify=False)
+            if resp.status_code in [200, 201]:
+                print(f'Marking as done for {watcher_name}')
+                ack_q.task_done()
+            else:
+                print(f'failed with status: {resp.status_code}')
+        except Exception as e:
+            print(f'Alert acknowledgement failed. {e}')
+
+
+threading.Thread(target=queue_worker, daemon=True).start()
+
+httpd = HTTPServer(('localhost', 8000), SimpleHTTPRequestHandler)
+httpd.serve_forever()
