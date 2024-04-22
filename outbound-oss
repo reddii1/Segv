@@ -1,0 +1,74 @@
+{
+  "trigger": {
+    "schedule": {
+      "interval": "1440m"
+    }
+  },
+  "input": {
+    "search": {
+      "request": {
+        "indices": [
+          "filebeat-*"
+        ],
+        "body": {
+          "size": 0,
+          "query": {
+            "bool": {
+              "filter": [
+                {
+                  "match_phrase": {
+                    "message": "Outgoing message successfully submitted to the CCN GW"
+                  }
+                },
+                {
+                  "range": {
+                    "@timestamp": {
+                      "gte": "now-24h",
+                      "lt": "now"
+                    }
+                  }
+                },
+                {
+                  "term": {
+                    "fields.environment": "{{ monitored_env }}"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "condition": {
+    "compare": {
+      "ctx.payload.hits.total": {
+        "eq": 0
+      }
+    }
+  },
+  "actions": {
+    "send_critical_alert": {
+      "webhook": {
+        "method": "POST",
+        "host": "localhost",
+        "port": 8000,
+        "path": "/alert",
+        "params": {
+          "watch_id": "{{ '{{ctx.watch_id}}' }}",
+          "watch_text": "There has been no traffic sent to EU in the last 24 hours. Please investigate.",
+          "trigger_time": "{{ '{{ctx.trigger.triggered_time}}' }}",
+          "watch_source": "ccn-outbound",
+          "check_time": "24"
+        }
+      }
+    }
+  },
+  "metadata": {
+    "xpack": {
+      "type": "json"
+    },
+    "name": "No traffic sent to the EU for more than 24 hours"
+  }
+}
+
